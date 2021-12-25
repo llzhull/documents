@@ -349,6 +349,199 @@ ContentProvider是伴随着进程的启动而被创建的，进程之间的通�
 - 进程B启动后会自然把IContentProvider发布给AMS，AMS先把他缓存起来，然后再返回给进程A
 - 进程A拿到IContentProvider之后，就是直接跨进程访问ContentProvider了。
 
+#### BroadcastReceiver
+
+广播接收器的注册过程
+
+<img src="https://s1.ax1x.com/2020/08/17/dnSOMQ.png" alt="Broadcast注册源码流程.png" style="zoom: 80%;" />
+
+
+
+```java
+//LoadedApk.java
+
+    final IIntentReceiver.Stub mIIntentReceiver;
+   
+        ReceiverDispatcher(BroadcastReceiver receiver, Context context,
+                Handler activityThread, Instrumentation instrumentation,
+                boolean registered) {
+         
+            mIIntentReceiver = new InnerReceiver(this, !registered);
+            
+        }
+
+        IIntentReceiver getIIntentReceiver() {
+            return mIIntentReceiver;
+        }
+
+//ContextImpl.java
+    private Intent registerReceiverInternal(BroadcastReceiver receiver, int userId,
+            IntentFilter filter, String broadcastPermission,
+            Handler scheduler, Context context, int flags) {
+        IIntentReceiver rd = null;
+        if (receiver != null) {
+            if (mPackageInfo != null && context != null) {
+                if (scheduler == null) {
+                    scheduler = mMainThread.getHandler();
+                }
+                rd = mPackageInfo.getReceiverDispatcher(
+                    receiver, context, scheduler,
+                    mMainThread.getInstrumentation(), true);
+            } else {
+                if (scheduler == null) {
+                    scheduler = mMainThread.getHandler();
+                }
+                rd = new LoadedApk.ReceiverDispatcher(
+                        receiver, context, scheduler, null, true).getIIntentReceiver();
+            }
+        }
+        try {
+            //调用AMS的registerReceiverWithFeature（）rd就是 mIIntentReceiver
+            final Intent intent = ActivityManager.getService().registerReceiverWithFeature(
+                    mMainThread.getApplicationThread(), mBasePackageName, getAttributionTag(), rd,
+                    filter, broadcastPermission, userId, flags);
+           
+            return intent;
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+    }
+
+
+//AndroidManagerService.java
+    public Intent registerReceiver(IApplicationThread caller, String callerPackage,
+            IIntentReceiver receiver, IntentFilter filter, String permission, int userId,
+            int flags) {
+        return registerReceiverWithFeature(caller, callerPackage, null, receiver, filter,
+                permission, userId, flags);
+    }
+
+
+//IIntentReceiver 就是 InnerReceiver
+	public Intent registerReceiverWithFeature(IIntentReceiver receiver){
+
+        //......
+        synchronized (this) {
+            
+            ReceiverList rl = mRegisteredReceivers.get(receiver.asBinder());
+            if (rl == null) {
+                rl = new ReceiverList(this, callerApp, callingPid, callingUid,
+                        userId, receiver);
+                if (rl.app != null) {
+                    final int totalReceiversForApp = rl.app.receivers.size();
+                    if (totalReceiversForApp >= MAX_RECEIVERS_ALLOWED_PER_APP) {
+                        throw new IllegalStateException("Too many receivers, total of "
+                                + totalReceiversForApp + ", registered for pid: "
+                                + rl.pid + ", callerPackage: " + callerPackage);
+                    }
+                    rl.app.receivers.add(rl);
+                } else {
+                    try {
+                        receiver.asBinder().linkToDeath(rl, 0);
+                    } catch (RemoteException e) {
+                        return sticky;
+                    }
+                    rl.linkedToDeath = true;
+                }
+                mRegisteredReceivers.put(receiver.asBinder(), rl);
+            } 
+            //....
+
+            return sticky;
+        }
+    }
+```
+
+
+
+Receiver是没有跨进程通信能力的，而广播需要AMS的调控，所以必须有一个可以跟AMS沟通的对象，这个对象是InnerReceiver，而ReceiverDispatcher就是负责维护他们两个的联系，如下图：
+
+![img](https://s1.ax1x.com/2020/10/11/0gkmW9.png)
+
+```java
+//LoadApk.java
+    static final class ReceiverDispatcher {
+
+        //通过InnerReceiver实现跨进程通信（和AMS进行通信）
+        final static class InnerReceiver extends IIntentReceiver.Stub {
+            final WeakReference<LoadedApk.ReceiverDispatcher> mDispatcher;
+            final LoadedApk.ReceiverDispatcher mStrongRef;
+
+            InnerReceiver(LoadedApk.ReceiverDispatcher rd, boolean strong) {
+                mDispatcher = new WeakReference<LoadedApk.ReceiverDispatcher>(rd);
+                mStrongRef = strong ? rd : null;
+            }
+
+            @Override
+            public void performReceive(Intent intent, int resultCode, String data,
+                    Bundle extras, boolean ordered, boolean sticky, int sendingUser) {
+                final LoadedApk.ReceiverDispatcher rd;
+                if (intent == null) {
+                    Log.wtf(TAG, "Null intent received");
+                    rd = null;
+                } else {
+                    rd = mDispatcher.get();
+                }
+               
+                if (rd != null) {
+                    rd.performReceive(intent, resultCode, data, extras,
+                            ordered, sticky, sendingUser);
+                }
+                //....
+            }
+        }
+
+
+        public void performReceive(Intent intent, int resultCode, String data,
+                Bundle extras, boolean ordered, boolean sticky, int sendingUser) {
+            final Args args = new Args(intent, resultCode, data, extras, ordered,
+                    sticky, sendingUser);
+
+            //执行args.getRunnable()
+            if (intent == null || !mActivityThread.post(args.getRunnable())) {
+                if (mRegistered && ordered) {
+                    IActivityManager mgr = ActivityManager.getService();
+                    if (ActivityThread.DEBUG_BROADCAST) Slog.i(ActivityThread.TAG,
+                            "Finishing sync broadcast to " + mReceiver);
+                    args.sendFinished(mgr);
+                }
+            }
+        }
+        
+        
+        final class Args extends BroadcastReceiver.PendingResult {
+
+            public final Runnable getRunnable() {
+                return () -> {
+                    final BroadcastReceiver receiver = mReceiver;
+
+                    //调用receiver.onReceive()
+                    try {
+                        ClassLoader cl = mReceiver.getClass().getClassLoader();
+                        intent.setExtrasClassLoader(cl);
+                        intent.prepareToEnterProcess();
+                        setExtrasClassLoader(cl);
+                        receiver.setPendingResult(this);
+                        receiver.onReceive(mContext, intent);
+                    } catch (Exception e) {
+                       
+                    }
+
+                    if (receiver.getPendingResult() != null) {
+                        finish();
+                    }
+                   
+                };
+            }
+        }
+
+
+
+    }
+```
+
+
+
 ### 系统服务
 
 ### 内存和存储
