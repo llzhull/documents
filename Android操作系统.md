@@ -1,3 +1,5 @@
+
+
 # Android 操作系统
 
 ## Android 虚拟机
@@ -274,6 +276,51 @@ system_server进程等待zygote返回进程创建完成(ZygoteConnection.handleP
 7. 主线程在收到Message后，通过发射机制创建目标Activity，并回调Activity.onCreate()等方法。
 
 到此，App便正式启动，开始进入Activity生命周期，执行完onCreate/onStart/onResume方法，UI渲染结束后便可以看到App的主界面。
+
+![aYQwF0.png](https://s1.ax1x.com/2020/08/02/aYQwF0.png)
+
+启动过程设计到两个进程：本地进程和系统服务进程。本地进程也就是我们的应用所在进程，系统服务进程为所有应用共用的服务进程。整体思路是：
+
+- activity向Instrumentation请求创建
+
+  ​	Instrumentation是activity与外界联系的类（不是activity本身的统称外界，相对activity而言），activity通过Instrumentation来请求创建，ActivityThread通过Instrumentation来创建activity和调用activity的生命周期。
+
+- Instrumentation通过AMS在本地进程的IBinder接口，访问AMS，这里采用的跨进程技术是AIDL。
+
+
+- 然后AMS进程一系列的工作，如判断该activity是否存在，启动模式是什么，有没有进行注册等等。
+
+
+- 通过ClientLifeCycleManager，利用本地进程在系统服务进程的IBinder接口直接访问本地ActivityThread。
+
+  ApplicationThread是ActivityThread的内部类，IApplicationThread是在远程服务端的Binder接口
+
+- ApplicationThread接收到服务端的事务后，把事务直接转交给ActivityThread处理。
+
+
+- ActivityThread通过Instrumentation利用类加载器进行创建实例，同时利用Instrumentation回调activity的生命中周期
+
+![aYGZVJ.png](https://s1.ax1x.com/2020/08/02/aYGZVJ.png)
+
+**Activity请求AMS的过程**
+
+![aGokDO.png](https://s1.ax1x.com/2020/08/01/aGokDO.png)
+
+
+
+**AMS处理请求的过程**
+
+<img src="https://s1.ax1x.com/2020/08/01/aGoya4.png" alt="aGoya4.png" style="zoom:150%;" />
+
+
+
+
+
+**ActivityThread创建Activity的过程**
+
+![aGoBrT.png](https://s1.ax1x.com/2020/08/01/aGoBrT.png)
+
+
 
 #### Service
 
